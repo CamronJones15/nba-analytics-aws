@@ -10,23 +10,17 @@ from nba_api.stats.endpoints import (
     leagueleaders,
     leaguestandingsv3,
     shotchartdetail,
-    commonallplayers,
 )
-from nba_api.stats.static import teams
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# nba_api requires a delay between requests to avoid rate limiting
 REQUEST_DELAY = 1.0
 CURRENT_SEASON = "2024-25"
 
 
 def get_player_stats(season: str = CURRENT_SEASON) -> pd.DataFrame:
-    """
-    Pull top player stats for a given season (points, assists, rebounds, etc.)
-    Returns a cleaned DataFrame.
-    """
+    """Pull top player stats for a given season."""
     logger.info(f"Fetching player stats for season {season}...")
     time.sleep(REQUEST_DELAY)
 
@@ -39,7 +33,6 @@ def get_player_stats(season: str = CURRENT_SEASON) -> pd.DataFrame:
 
     df = response.get_data_frames()[0]
 
-    # Select and rename key columns
     df = df[[
         "PLAYER_ID", "PLAYER", "TEAM", "GP", "MIN",
         "PTS", "AST", "REB", "STL", "BLK",
@@ -68,10 +61,7 @@ def get_player_stats(season: str = CURRENT_SEASON) -> pd.DataFrame:
 
 
 def get_team_standings(season: str = CURRENT_SEASON) -> pd.DataFrame:
-    """
-    Pull current NBA team standings.
-    Returns a cleaned DataFrame with wins, losses, and conference info.
-    """
+    """Pull current NBA team standings."""
     logger.info(f"Fetching team standings for season {season}...")
     time.sleep(REQUEST_DELAY)
 
@@ -82,30 +72,40 @@ def get_team_standings(season: str = CURRENT_SEASON) -> pd.DataFrame:
 
     df = response.get_data_frames()[0]
 
-    df = df[[
-        "TeamID", "TeamCity", "TeamName", "TeamAbbreviation",
-        "Conference", "Division", "WINS", "LOSSES",
-        "WinPCT", "HOME", "ROAD", "L10",
-        "PointsPG", "OppPointsPG", "DiffPointsPG"
-    ]].copy()
+    # Normalize — nba_api column names change across versions
+    col_map = {c.lower(): c for c in df.columns}
 
-    df.rename(columns={
-        "TeamID": "team_id",
-        "TeamCity": "team_city",
-        "TeamName": "team_name",
-        "TeamAbbreviation": "team_abbreviation",
-        "Conference": "conference",
-        "Division": "division",
-        "WINS": "wins",
-        "LOSSES": "losses",
-        "WinPCT": "win_pct",
-        "HOME": "home_record",
-        "ROAD": "away_record",
-        "L10": "last_10_record",
-        "PointsPG": "points_per_game",
-        "OppPointsPG": "opp_points_per_game",
-        "DiffPointsPG": "point_differential",
-    }, inplace=True)
+    def get_col(*candidates):
+        for c in candidates:
+            if c.lower() in col_map:
+                return col_map[c.lower()]
+        raise KeyError(f"None of {candidates} found. Available: {list(df.columns)}")
+
+    selected = [
+        get_col("TeamID"),
+        get_col("TeamCity"),
+        get_col("TeamName"),
+        get_col("TeamAbbreviation", "TeamSlug"),
+        get_col("Conference"),
+        get_col("Division"),
+        get_col("WINS", "W"),
+        get_col("LOSSES", "L"),
+        get_col("WinPCT", "PCT"),
+        get_col("HOME"),
+        get_col("ROAD", "AWAY"),
+        get_col("L10"),
+        get_col("PointsPG", "PPG"),
+        get_col("OppPointsPG", "OppPPG"),
+        get_col("DiffPointsPG", "DIFF"),
+    ]
+
+    df = df[selected].copy()
+    df.columns = [
+        "team_id", "team_city", "team_name", "team_abbreviation",
+        "conference", "division", "wins", "losses",
+        "win_pct", "home_record", "away_record", "last_10_record",
+        "points_per_game", "opp_points_per_game", "point_differential",
+    ]
 
     df["season"] = season
     logger.info(f"  -> Retrieved {len(df)} teams")
@@ -113,10 +113,7 @@ def get_team_standings(season: str = CURRENT_SEASON) -> pd.DataFrame:
 
 
 def get_shot_chart(player_id: int, season: str = CURRENT_SEASON) -> pd.DataFrame:
-    """
-    Pull shot chart data for a specific player.
-    Returns a DataFrame with shot location (x, y), result, and shot type.
-    """
+    """Pull shot chart data for a specific player."""
     logger.info(f"Fetching shot chart for player_id={player_id}, season={season}...")
     time.sleep(REQUEST_DELAY)
 
@@ -147,16 +144,7 @@ def get_shot_chart(player_id: int, season: str = CURRENT_SEASON) -> pd.DataFrame
     return df
 
 
-def get_top_player_ids(n: int = 10, season: str = CURRENT_SEASON) -> list:
-    """
-    Returns the player IDs of the top N scorers — used to pull shot charts.
-    """
-    df = get_player_stats(season)
-    return df.head(n)["PLAYER_ID"].tolist() if "PLAYER_ID" in df.columns else []
-
-
 if __name__ == "__main__":
-    # Quick smoke test — run locally with: python ingestion/nba_client.py
     print("\n--- Player Stats ---")
     players = get_player_stats()
     print(players.head())
