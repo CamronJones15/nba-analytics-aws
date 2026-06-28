@@ -1,155 +1,170 @@
 """
 transform_stats.py
-AWS Glue ETL job — transforms raw CSV data from S3 into
-optimized Parquet format for Athena querying.
-
-Deployed to: s3://<bucket>/glue_scripts/transform_stats.py
+AWS Glue Python Shell job — transforms raw CSV data from S3
+into Parquet format for Athena querying.
+Uses boto3 + pandas instead of PySpark for simplicity and reliability.
 """
 
 import sys
+import os
 import logging
-from awsglue.transforms import *
-from awsglue.utils import getResolvedOptions
-from pyspark.context import SparkContext
-from awsglue.context import GlueContext
-from awsglue.job import Job
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    DoubleType, IntegerType, StringType
-)
+import boto3
+import pandas as pd
+from io import StringIO, BytesIO
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Job args ──────────────────────────────────────────────────────────────────
-args = getResolvedOptions(sys.argv, ["JOB_NAME", "S3_BUCKET", "DATABASE_NAME"])
+# ── Args (passed in as Glue job parameters) ───────────────────────────────────
+args = {}
+for i, arg in enumerate(sys.argv[1:], 1):
+    if arg.startswith("--") and i < len(sys.argv) - 1:
+        key = arg.lstrip("--")
+        val = sys.argv[i + 1] if not sys.argv[i + 1].startswith("--") else ""
+        args[key] = val
 
-sc = SparkContext()
-glueContext = GlueContext(sc)
-spark = glueContext.spark_session
-job = Job(glueContext)
-job.init(args["JOB_NAME"], args)
+S3_BUCKET = args.get("S3_BUCKET", os.environ.get("S3_BUCKET", "nba-analytics-camron"))
+logger.info(f"Using bucket: {S3_BUCKET}")
 
-S3_BUCKET = args["S3_BUCKET"]
-RAW_BASE = f"s3://{S3_BUCKET}/raw"
-PROCESSED_BASE = f"s3://{S3_BUCKET}/processed"
+s3 = boto3.client("s3", region_name="us-east-1")
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
-def write_parquet(df, output_path: str, partition_cols: list = None):
-    """Write a Spark DataFrame to S3 as Parquet, optionally partitioned."""
-    writer = df.write.mode("overwrite").format("parquet")
-    if partition_cols:
-        writer = writer.partitionBy(*partition_cols)
-    writer.save(output_path)
-    logger.info(f"Written to {output_path}")
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def list_s3_csvs(prefix: str) -> list:
+    """List all CSV files under a given S3 prefix."""
+    paginator = s3.get_paginator("list_objects_v2")
+    keys = []
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if obj["Key"].endswith(".csv"):
+                keys.append(obj["Key"])
+    return keys
+
+
+def read_csv_from_s3(key: str) -> pd.DataFrame:
+    """Read a CSV file from S3 into a DataFrame."""
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+    return pd.read_csv(StringIO(obj["Body"].read().decode("utf-8")))
+
+
+def write_parquet_to_s3(df: pd.DataFrame, key: str):
+    """Write a DataFrame as Parquet to S3."""
+    buffer = BytesIO()
+    df.to_parquet(buffer, index=False, engine="pyarrow")
+    buffer.seek(0)
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=buffer.getvalue())
+    logger.info(f"  -> Written to s3://{S3_BUCKET}/{key}")
 
 
 # ── 1. Player Stats ───────────────────────────────────────────────────────────
 logger.info("Transforming player stats...")
+player_keys = list_s3_csvs("raw/player_stats/")
+logger.info(f"  Found {len(player_keys)} CSV files")
 
-player_df = spark.read.option("header", "true").csv(
-    f"{RAW_BASE}/player_stats/"
-)
+if player_keys:
+    player_dfs = [read_csv_from_s3(k) for k in player_keys]
+    player_df = pd.concat(player_dfs, ignore_index=True)
 
-player_df = (
-    player_df
-    .withColumn("games_played",       F.col("games_played").cast(IntegerType()))
-    .withColumn("minutes_per_game",   F.col("minutes_per_game").cast(DoubleType()))
-    .withColumn("points_per_game",    F.col("points_per_game").cast(DoubleType()))
-    .withColumn("assists_per_game",   F.col("assists_per_game").cast(DoubleType()))
-    .withColumn("rebounds_per_game",  F.col("rebounds_per_game").cast(DoubleType()))
-    .withColumn("steals_per_game",    F.col("steals_per_game").cast(DoubleType()))
-    .withColumn("blocks_per_game",    F.col("blocks_per_game").cast(DoubleType()))
-    .withColumn("field_goal_pct",     F.col("field_goal_pct").cast(DoubleType()))
-    .withColumn("three_point_pct",    F.col("three_point_pct").cast(DoubleType()))
-    .withColumn("free_throw_pct",     F.col("free_throw_pct").cast(DoubleType()))
-    .withColumn("efficiency_rating",  F.col("efficiency_rating").cast(DoubleType()))
+    numeric_cols = [
+        "games_played", "minutes_per_game", "points_per_game",
+        "assists_per_game", "rebounds_per_game", "steals_per_game",
+        "blocks_per_game", "field_goal_pct", "three_point_pct",
+        "free_throw_pct", "efficiency_rating"
+    ]
+    for col in numeric_cols:
+        if col in player_df.columns:
+            player_df[col] = pd.to_numeric(player_df[col], errors="coerce")
+
     # Derived columns
-    .withColumn("points_per_36",
-        F.round(F.col("points_per_game") / F.col("minutes_per_game") * 36, 2))
-    .withColumn("assist_to_rebound_ratio",
-        F.round(F.col("assists_per_game") / F.col("rebounds_per_game"), 2))
-    .withColumn("true_shooting_pct",
-        F.round(
-            F.col("points_per_game") / (
-                2 * (F.col("field_goal_pct") + 0.44 * F.col("free_throw_pct"))
-            ), 3
-        )
-    )
-    .withColumn("ingested_at", F.current_timestamp())
-    .dropDuplicates(["PLAYER_ID", "season"])
-    .filter(F.col("games_played") > 0)
-)
+    player_df["points_per_36"] = (
+        player_df["points_per_game"] / player_df["minutes_per_game"] * 36
+    ).round(2)
 
-write_parquet(player_df, f"{PROCESSED_BASE}/player_stats/", partition_cols=["season"])
-logger.info(f"Player stats rows: {player_df.count()}")
+    player_df["true_shooting_pct"] = (
+        player_df["points_per_game"] / (
+            2 * (player_df["field_goal_pct"] + 0.44 * player_df["free_throw_pct"])
+        )
+    ).round(3)
+
+    player_df["win_pct_label"] = pd.cut(
+        player_df["efficiency_rating"],
+        bins=[-999, 10, 15, 20, 999],
+        labels=["Bench", "Role Player", "Starter", "Star"]
+    ).astype(str)
+
+    player_df = player_df.drop_duplicates(subset=["PLAYER_ID", "season"])
+    player_df = player_df[player_df["games_played"] > 0]
+
+    write_parquet_to_s3(player_df, "processed/player_stats/player_stats.parquet")
+    logger.info(f"  Player stats rows: {len(player_df)}")
 
 
 # ── 2. Team Standings ─────────────────────────────────────────────────────────
 logger.info("Transforming team standings...")
+standings_keys = list_s3_csvs("raw/team_standings/")
+logger.info(f"  Found {len(standings_keys)} CSV files")
 
-standings_df = spark.read.option("header", "true").csv(
-    f"{RAW_BASE}/team_standings/"
-)
+if standings_keys:
+    standings_dfs = [read_csv_from_s3(k) for k in standings_keys]
+    standings_df = pd.concat(standings_dfs, ignore_index=True)
 
-standings_df = (
-    standings_df
-    .withColumn("wins",               F.col("wins").cast(IntegerType()))
-    .withColumn("losses",             F.col("losses").cast(IntegerType()))
-    .withColumn("win_pct",            F.col("win_pct").cast(DoubleType()))
-    .withColumn("points_per_game",    F.col("points_per_game").cast(DoubleType()))
-    .withColumn("opp_points_per_game",F.col("opp_points_per_game").cast(DoubleType()))
-    .withColumn("point_differential", F.col("point_differential").cast(DoubleType()))
-    # Derived columns
-    .withColumn("total_games",
-        F.col("wins") + F.col("losses"))
-    .withColumn("win_pct_label",
-        F.when(F.col("win_pct") >= 0.6, "Elite")
-         .when(F.col("win_pct") >= 0.5, "Playoff Contender")
-         .when(F.col("win_pct") >= 0.4, "Fringe")
-         .otherwise("Lottery"))
-    .withColumn("net_rating",
-        F.round(F.col("points_per_game") - F.col("opp_points_per_game"), 2))
-    .withColumn("ingested_at", F.current_timestamp())
-    .dropDuplicates(["team_id", "season"])
-)
+    numeric_cols = [
+        "wins", "losses", "win_pct",
+        "points_per_game", "opp_points_per_game", "point_differential"
+    ]
+    for col in numeric_cols:
+        if col in standings_df.columns:
+            standings_df[col] = pd.to_numeric(standings_df[col], errors="coerce")
 
-write_parquet(standings_df, f"{PROCESSED_BASE}/team_standings/", partition_cols=["season"])
-logger.info(f"Team standings rows: {standings_df.count()}")
+    standings_df["total_games"] = standings_df["wins"] + standings_df["losses"]
+    standings_df["net_rating"] = (
+        standings_df["points_per_game"] - standings_df["opp_points_per_game"]
+    ).round(2)
+
+    def win_label(pct):
+        if pct >= 0.6:   return "Elite"
+        if pct >= 0.5:   return "Playoff Contender"
+        if pct >= 0.4:   return "Fringe"
+        return "Lottery"
+
+    standings_df["win_pct_label"] = standings_df["win_pct"].apply(win_label)
+    standings_df = standings_df.drop_duplicates(subset=["team_id", "season"])
+
+    write_parquet_to_s3(standings_df, "processed/team_standings/team_standings.parquet")
+    logger.info(f"  Team standings rows: {len(standings_df)}")
 
 
 # ── 3. Shot Charts ────────────────────────────────────────────────────────────
-logger.info("Transforming shot chart data...")
+logger.info("Transforming shot charts...")
+shot_keys = list_s3_csvs("raw/shot_charts/")
+logger.info(f"  Found {len(shot_keys)} CSV files")
 
-shots_df = spark.read.option("header", "true").csv(
-    f"{RAW_BASE}/shot_charts/"
-)
+if shot_keys:
+    shot_dfs = [read_csv_from_s3(k) for k in shot_keys]
+    shots_df = pd.concat(shot_dfs, ignore_index=True)
 
-shots_df = (
-    shots_df
-    .withColumn("loc_x",          F.col("loc_x").cast(IntegerType()))
-    .withColumn("loc_y",          F.col("loc_y").cast(IntegerType()))
-    .withColumn("shot_distance",  F.col("shot_distance").cast(IntegerType()))
-    .withColumn("shot_made_flag", F.col("shot_made_flag").cast(IntegerType()))
-    # Classify shot zones
-    .withColumn("shot_zone_label",
-        F.when(F.col("shot_distance") <= 3,  "At Rim")
-         .when(F.col("shot_distance") <= 10, "Short Mid-Range")
-         .when(F.col("shot_distance") <= 16, "Mid-Range")
-         .when(F.col("shot_distance") <= 22, "Long Mid-Range")
-         .otherwise("Three-Point"))
-    # Flag whether shot was made as boolean label
-    .withColumn("made_label",
-        F.when(F.col("shot_made_flag") == 1, "Made").otherwise("Missed"))
-    .withColumn("ingested_at", F.current_timestamp())
-    .dropDuplicates(["game_id", "player_id", "loc_x", "loc_y", "period"])
-)
+    numeric_cols = ["loc_x", "loc_y", "shot_distance", "shot_made_flag", "period"]
+    for col in numeric_cols:
+        if col in shots_df.columns:
+            shots_df[col] = pd.to_numeric(shots_df[col], errors="coerce")
 
-write_parquet(shots_df, f"{PROCESSED_BASE}/shot_charts/", partition_cols=["season", "player_id"])
-logger.info(f"Shot chart rows: {shots_df.count()}")
+    def zone_label(dist):
+        if dist <= 3:   return "At Rim"
+        if dist <= 10:  return "Short Mid-Range"
+        if dist <= 16:  return "Mid-Range"
+        if dist <= 22:  return "Long Mid-Range"
+        return "Three-Point"
+
+    shots_df["shot_zone_label"] = shots_df["shot_distance"].apply(zone_label)
+    shots_df["made_label"] = shots_df["shot_made_flag"].apply(
+        lambda x: "Made" if x == 1 else "Missed"
+    )
+    shots_df = shots_df.drop_duplicates(
+        subset=["game_id", "player_id", "loc_x", "loc_y", "period"]
+    )
+
+    write_parquet_to_s3(shots_df, "processed/shot_charts/shot_charts.parquet")
+    logger.info(f"  Shot chart rows: {len(shots_df)}")
 
 
-# ── Done ──────────────────────────────────────────────────────────────────────
 logger.info("All transforms complete.")
-job.commit()

@@ -59,10 +59,9 @@ resource "aws_lambda_function" "nba_ingestion" {
   filename         = "lambda_placeholder.zip"
   source_code_hash = filebase64sha256("lambda_placeholder.zip")
 
-  environment {
+   environment {
     variables = {
       S3_BUCKET_NAME = var.bucket_name
-      AWS_REGION     = var.aws_region
       SEASON         = "2024-25"
     }
   }
