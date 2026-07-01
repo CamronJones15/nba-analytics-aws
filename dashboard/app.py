@@ -155,7 +155,7 @@ if page == "Player Stats":
                    CAST(three_point_pct AS DOUBLE)   AS three_pct,
                    CAST(efficiency_rating AS DOUBLE) AS efficiency,
                    CAST(true_shooting_pct AS DOUBLE) AS ts_pct
-            FROM processed.player_stats
+            FROM nba_analytics.player_stats
             WHERE season = '{season}' AND CAST(games_played AS INT) >= 20
             ORDER BY ppg DESC
             LIMIT 50
@@ -166,7 +166,7 @@ if page == "Player Stats":
         st.stop()
 
     # Convert numeric columns
-    for col in ["ppg", "apg", "rpg", "fg_pct", "three_pct", "efficiency", "ts_pct"]:
+    for col in ["ppg", "apg", "rpg", "fg_pct", "three_pct", "efficiency", "ts_pct", "games_played"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # ── KPI row ───────────────────────────────────────────────────────────────
@@ -250,7 +250,7 @@ elif page == "Team Standings":
                    CAST(opp_points_per_game AS DOUBLE)     AS opp_ppg,
                    CAST(net_rating AS DOUBLE)              AS net_rating,
                    home_record, away_record, last_10_record
-            FROM processed.team_standings
+            FROM nba_analytics.team_standings
             WHERE season = '{season}'
             ORDER BY win_pct DESC
         """)
@@ -318,7 +318,7 @@ elif page == "Shot Analysis":
     with st.spinner("Loading shot data..."):
         players_df = run_athena_query(f"""
             SELECT DISTINCT player_name
-            FROM processed.shot_charts
+            FROM nba_analytics.shot_charts
             WHERE season = '{season}'
             ORDER BY player_name
         """)
@@ -339,7 +339,7 @@ elif page == "Shot Analysis":
                    made_label, action_type, shot_type,
                    CAST(period AS INT)           AS period,
                    CAST(minutes_remaining AS INT) AS minutes_remaining
-            FROM processed.shot_charts
+            FROM nba_analytics.shot_charts
             WHERE season = '{season}' AND player_name = '{selected_player}'
         """)
 
